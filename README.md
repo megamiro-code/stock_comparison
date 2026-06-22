@@ -1,0 +1,2 @@
+# stock_comparison
+株価をyfinanceライブラリを用いて取得する練習用のコードです。
