@@ -29,10 +29,12 @@ FETCH_END    = date.today().strftime("%Y-%m-%d")
 RESAMPLE_FREQ = "Weekly"   # default; must match a key in FREQ_CODES below
 
 TICKERS = {
-    # label              ticker        currency
-    "Nikkei 225":      ("^N225",      "JPY"),
-    "TOPIX (1306.T)":  ("1306.T",     "JPY"),   # TOPIX ETF — proxy for TOPIX
-    "S&P 500":         ("^GSPC",      "USD"),
+    # label                 ticker(s)                          currency
+    "Nikkei 225":         ("^N225",                         "JPY"),
+    # TOPIX can be unstable on Yahoo depending on the symbol.
+    # Use the index first, then fall back to alternatives.
+    "TOPIX":              (("^TPX", "^TOPX", "1306.T"),     "JPY"),
+    "S&P 500":            ("^GSPC",                         "USD"),
     "DAX":             ("^GDAXI",     "EUR"),
     "FTSE 100":        ("^FTSE",      "GBP"),
     "CAC 40":          ("^FCHI",      "EUR"),
@@ -43,8 +45,8 @@ TICKERS = {
     "ASX 200":         ("^AXJO",      "AUD"),
     "TSX":             ("^GSPTSE",    "CAD"),
     "FTSE MIB":        ("FTSEMIB.MI", "EUR"),
-    "Gold (JPY/g)":    ("GC=F",       "USD"),
-    "Silver (JPY/g)":  ("SI=F",       "USD"),
+    "Gold (JPY/g)":   ("GC=F",       "USD"),
+    "Silver (JPY/g)": ("SI=F",       "USD"),
     "J-REIT":          ("1343.T",     "JPY"),
     "US REIT (VNQ)":   ("VNQ",        "USD"),
 }
@@ -55,6 +57,78 @@ FX_MAP = {
     "INR": "INRJPY=X", "KRW": "KRWJPY=X", "BRL": "BRLJPY=X",
     "JPY": None,
 }
+
+# Some FX tickers on Yahoo can effectively be quoted in 100-unit terms
+# (most notably KRW in some data windows). Keep the Claude structure, but
+# normalize these cases so the JPY conversion stays stable.
+FX_UNIT_FACTOR = {
+    "KRW": 100.0,
+}
+
+def ticker_candidates(spec):
+    """Return a list of ticker strings from a TICKERS entry."""
+    if isinstance(spec, (tuple, list)):
+        if len(spec) == 2 and isinstance(spec[0], str):
+            return [spec[0]]
+        if len(spec) == 2 and isinstance(spec[0], (tuple, list)):
+            return list(spec[0])
+        return list(spec)
+    return [spec]
+
+
+def pick_best_ticker(ticker_spec, raw_close: pd.DataFrame):
+    """Pick the candidate with enough history and the smoothest continuity.
+
+    This avoids unstable Yahoo symbols winning just because they appear first,
+    and reduces the chance of selecting a proxy series with a split-like jump.
+    """
+    best_ticker = None
+    best_score = None  # (usable_points, -big_jump_count, -max_jump, earliest_date)
+
+    for ticker in ticker_candidates(ticker_spec):
+        if ticker not in raw_close.columns:
+            continue
+        s = raw_close[ticker].dropna()
+        if len(s) < 2:
+            continue
+
+        pct = s.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        if pct.empty:
+            big_jump_count = 0
+            max_jump = 0.0
+        else:
+            # Penalize structural discontinuities heavily.
+            big_jump_count = int((pct.abs() > 0.35).sum())
+            max_jump = float(pct.abs().max())
+
+        score = (int(s.shape[0]), -big_jump_count, -max_jump, s.index[0])
+        if best_score is None or score > best_score:
+            best_score = score
+            best_ticker = ticker
+
+    return best_ticker
+
+def normalise_fx_series(fx: pd.Series, ccy: str) -> pd.Series:
+    """Convert a Yahoo FX series to JPY per 1 unit of the foreign currency.
+
+    Some Yahoo FX tickers are effectively quoted in 100-unit terms. For those
+    currencies we apply a factor so the equity series does not show artificial
+    jumps or level shifts.
+    """
+    fx = fx.dropna().copy()
+    factor = FX_UNIT_FACTOR.get(ccy, 1.0)
+
+    # Guardrail: if a low-value currency quote is clearly in 100-unit terms,
+    # force the correction even if the hard-coded factor is absent.
+    if ccy == "KRW" and len(fx) > 20:
+        med = float(fx.median())
+        if med > 1.0:
+            factor = 100.0
+
+    if factor != 1.0:
+        fx = fx / factor
+
+    return fx
 
 COLORS = [
     "#1f77b4","#d62728","#2ca02c","#ff7f0e","#9467bd",
@@ -74,38 +148,49 @@ FREQ_CODES    = {"Daily": "D", "Weekly": "W", "Monthly": "ME"}
 # ══════════════════════════════════════════════
 print("Downloading price data…")
 
-all_t  = list({t for t,_ in TICKERS.values()})
-fx_t   = list({FX_MAP[c] for _,c in TICKERS.values() if c != "JPY"})
+all_t  = sorted({t for spec, _ in TICKERS.values() for t in ticker_candidates(spec)})
+fx_t   = sorted({FX_MAP[c] for _, c in TICKERS.values() if c != "JPY" and FX_MAP[c] is not None})
 
 raw_p  = yf.download(all_t, start=FETCH_START, end=FETCH_END,
-                     progress=True,  auto_adjust=True)["Close"]
-raw_fx = yf.download(fx_t,  start=FETCH_START, end=FETCH_END,
+                     progress=True, auto_adjust=True)["Close"]
+raw_fx = yf.download(fx_t, start=FETCH_START, end=FETCH_END,
                      progress=False, auto_adjust=True)["Close"]
 
-if isinstance(raw_p,  pd.Series): raw_p  = raw_p.to_frame(name=all_t[0])
-if isinstance(raw_fx, pd.Series): raw_fx = raw_fx.to_frame(name=fx_t[0])
+if isinstance(raw_p, pd.Series):
+    raw_p = raw_p.to_frame(name=all_t[0])
+if isinstance(raw_fx, pd.Series):
+    raw_fx = raw_fx.to_frame(name=fx_t[0])
 
 # build daily JPY series (resample later per frequency)
 daily = {}
-for label, (ticker, ccy) in TICKERS.items():
-    if ticker not in raw_p.columns:
-        print(f"  [SKIP] {label} — ticker not found")
+for label, (ticker_spec, ccy) in TICKERS.items():
+    picked = pick_best_ticker(ticker_spec, raw_p)
+    if picked is None:
+        print(f"  [SKIP] {label} — no usable price series found")
         continue
-    s = raw_p[ticker].dropna()
+
+    s = raw_p[picked].dropna()
     if s.empty:
         print(f"  [SKIP] {label} — empty")
         continue
+
     if ccy != "JPY":
         fx_col = FX_MAP[ccy]
         if fx_col not in raw_fx.columns:
             print(f"  [SKIP] {label} — FX missing")
             continue
         fx = raw_fx[fx_col].reindex(s.index, method="ffill").dropna()
+        fx = normalise_fx_series(fx, ccy)
         s  = s.reindex(fx.index).dropna() * fx
+        if ccy in FX_UNIT_FACTOR or (ccy == "KRW" and len(fx) > 20):
+            print(f"    [FX]  {label} — applied unit factor correction")
+
+    # Convert gold/silver futures from oz to gram after JPY conversion
     if label in ("Gold (JPY/g)", "Silver (JPY/g)"):
         s = s / TROY_TO_G
+
     daily[label] = s
-    print(f"  [OK]  {label}: {s.index[0].date()} — {s.index[-1].date()}  ({len(s)} days)")
+    print(f"  [OK]  {label} [{picked}]: {s.index[0].date()} — {s.index[-1].date()}  ({len(s)} days)")
 
 if not daily:
     sys.exit("No data downloaded. Check internet connection.")
@@ -125,39 +210,102 @@ def resample_series(freq_code):
             r = s.resample("W-FRI").last().dropna()
         else:  # ME
             r = s.resample("ME").last().dropna()
-        if len(r) >= 2:
+        if len(r) >= 1:
             out[lb] = r
     return out
 
-def earliest_base(resampled):
-    """Latest first-date across all series = hard lower bound."""
-    first = {k: v.index[0] for k,v in resampled.items()}
-    key   = max(first, key=lambda k: first[k])
+def common_start(resampled):
+    """Latest first-date across all series currently available."""
+    first = {k: v.index[0] for k, v in resampled.items()}
+    key = max(first, key=lambda k: first[k])
     return first[key], key
 
 def get_normalised(label, resampled, base_date, base_value):
+    """Normalise from the first available value on/after base_date.
+
+    Returns
+    -------
+    (series, reason)
+        reason is None when the series can be drawn.
+    """
     if label not in resampled:
-        return None
+        return None, "not available at this frequency"
     s = resampled[label]
     clipped = s[s.index >= pd.Timestamp(base_date)]
     if clipped.empty:
-        return None
+        return None, "no data on/after selected base date"
     base = clipped.iloc[0]
-    return None if base == 0 else clipped / base * base_value
+    if base == 0:
+        return None, "base value is zero"
+    return clipped / base * base_value, None
+
+
+def parse_date_text(text):
+    """Parse YYYY-MM / YYYY-MM-DD / slashed variants into a Timestamp."""
+    text = text.strip()
+    for fmt in ("%Y-%m", "%Y-%m-%d", "%Y/%m", "%Y/%m/%d"):
+        try:
+            return pd.to_datetime(text, format=fmt)
+        except ValueError:
+            continue
+    try:
+        return pd.to_datetime(text)
+    except Exception:
+        return None
+
+
+def repair_split_like_jump(series: pd.Series, label: str) -> pd.Series:
+    """If a series has a single huge discontinuity, stitch the later segment.
+
+    This is a conservative repair for proxy series such as TOPIX ETFs where
+    Yahoo sometimes serves a split-like jump that is not part of the market move.
+    """
+    if len(series) < 10:
+        return series
+
+    pct = series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if pct.empty:
+        return series
+
+    # Only intervene when the jump is clearly structural.
+    jump_idx = pct.abs().idxmax()
+    jump_mag = float(abs(pct.loc[jump_idx]))
+    if jump_mag < 0.70:
+        return series
+
+    pos = series.index.get_indexer([jump_idx])[0]
+    if pos <= 0 or pos >= len(series) - 1:
+        return series
+
+    prev_val = float(series.iloc[pos - 1])
+    curr_val = float(series.iloc[pos])
+
+    if prev_val <= 0 or curr_val <= 0:
+        return series
+
+    # If this looks like a step change, rescale the post-jump segment.
+    factor = prev_val / curr_val
+    repaired = series.copy()
+    repaired.iloc[pos:] = repaired.iloc[pos:] * factor
+
+    print(f"  [FIX]  {label} — stitched split-like jump at {jump_idx.date()} (x{factor:.4g})")
+    return repaired
+
 
 # ══════════════════════════════════════════════
 #  3. INITIAL STATE
 # ══════════════════════════════════════════════
 resampled = resample_series(FREQ_CODES[RESAMPLE_FREQ])
-earliest, shortest_key = earliest_base(resampled)
+common_earliest, shortest_key = common_start(resampled)
 
 state = {
     "freq":       RESAMPLE_FREQ,
     "resampled":  resampled,
-    "earliest":   earliest,
+    "common_earliest": common_earliest,
     "shortest":   shortest_key,
-    "base_date":  earliest,
+    "base_date":  common_earliest,
     "base_value": BASE_VALUE,
+    "end_date":   pd.Timestamp(FETCH_END),
     "active":     {lb: (lb in DEFAULT_ON) for lb in labels_list},
 }
 
@@ -175,15 +323,15 @@ fig.patch.set_facecolor("#f8f9fa")
 #   [controls row 2         ]
 #   [footer                 ]
 
-AX_CHART  = [0.21, 0.20, 0.77, 0.70]   # chart leaves room below for labels
-AX_CHECKS = [0.01, 0.20, 0.18, 0.70]
-AX_TITLE  = [0.21, 0.91, 0.77, 0.07]
+AX_CHART  = [0.25, 0.20, 0.73, 0.70]   # chart leaves room below for labels
+AX_CHECKS = [0.01, 0.20, 0.22, 0.70]
+AX_TITLE  = [0.25, 0.91, 0.73, 0.07]
 
 ax_chart  = fig.add_axes(AX_CHART)
 ax_checks = fig.add_axes(AX_CHECKS)
 ax_title  = fig.add_axes(AX_TITLE);  ax_title.axis("off")
 ax_checks.set_facecolor("#f0f0f0")
-ax_checks.set_title("Select indices", fontsize=9, pad=4, color="#333")
+ax_checks.set_title("Select indices", fontsize=13, pad=9, color="#333", fontweight="bold")
 
 # ── control row 1: base-date  +  base-value  (y≈0.12)
 y1 = 0.125
@@ -192,19 +340,26 @@ ax_bd_lbl = fig.add_axes([0.21, y1, 0.09, 0.04]); ax_bd_lbl.axis("off")
 ax_bd_lbl.text(1.0, 0.5, "Base date (YYYY-MM):", ha="right", va="center",
                fontsize=8, color="#444")
 ax_bd_box = fig.add_axes([0.31, y1+0.005, 0.10, 0.033])
-tb_date   = TextBox(ax_bd_box, "", initial=earliest.strftime("%Y-%m"))
+tb_date   = TextBox(ax_bd_box, "", initial=common_earliest.strftime("%Y-%m"))
 
-# earliest-info text
-ax_bd_inf = fig.add_axes([0.42, y1, 0.28, 0.04]); ax_bd_inf.axis("off")
+# common_earliest-info text
+ax_bd_inf = fig.add_axes([0.42, y1, 0.16, 0.04]); ax_bd_inf.axis("off")
 bd_info   = ax_bd_inf.text(0, 0.5,
-    f"Earliest: {earliest.strftime('%Y-%m')}  (limited by '{shortest_key}')",
-    va="center", fontsize=7.5, color="#666")
+    f"Common start: {common_earliest.strftime('%Y-%m')}  (limited by '{shortest_key}')",
+    va="center", fontsize=7.1, color="#666")
+
+# End date label + box
+ax_ed_lbl = fig.add_axes([0.58, y1, 0.06, 0.04]); ax_ed_lbl.axis("off")
+ax_ed_lbl.text(1.0, 0.5, "End date:", ha="right", va="center",
+               fontsize=8, color="#444")
+ax_ed_box = fig.add_axes([0.645, y1+0.005, 0.10, 0.033])
+tb_edate  = TextBox(ax_ed_box, "", initial=pd.Timestamp(FETCH_END).strftime("%Y-%m"))
 
 # Base value label + box
-ax_bv_lbl = fig.add_axes([0.71, y1, 0.07, 0.04]); ax_bv_lbl.axis("off")
+ax_bv_lbl = fig.add_axes([0.76, y1, 0.07, 0.04]); ax_bv_lbl.axis("off")
 ax_bv_lbl.text(1.0, 0.5, "Base value:", ha="right", va="center",
                fontsize=8, color="#444")
-ax_bv_box = fig.add_axes([0.79, y1+0.005, 0.07, 0.033])
+ax_bv_box = fig.add_axes([0.84, y1+0.005, 0.07, 0.033])
 tb_bval   = TextBox(ax_bv_box, "", initial=str(BASE_VALUE))
 
 # ── control row 2: freq buttons  +  select/clear  +  save  (y≈0.07)
@@ -234,7 +389,13 @@ for b in (btn_all, btn_clear, btn_save):
 check_init = [state["active"][lb] for lb in labels_list]
 chk = CheckButtons(ax_checks, labels_list, check_init)
 for t in chk.labels:
-    t.set_fontsize(7.5); t.set_color("#222")
+    t.set_fontsize(10); t.set_color("#222")
+
+# Make the checkbox labels easier to read across Matplotlib versions
+# (Older Matplotlib builds do not expose chk.rectangles.)
+for label in chk.labels:
+    label.set_fontsize(10)
+    label.set_color("#222")
 
 # ══════════════════════════════════════════════
 #  6. REDRAW
@@ -249,17 +410,33 @@ def redraw():
 
     rs  = state["resampled"]
     bd  = state["base_date"]
+    ed  = state["end_date"]
     bv  = state["base_value"]
+
     plotted = []
+    missing = []
 
     for i, label in enumerate(labels_list):
-        if not state["active"][label]: continue
-        ns = get_normalised(label, rs, bd, bv)
-        if ns is None: continue
+        if not state["active"][label]:
+            continue
+        ns, reason = get_normalised(label, rs, bd, bv)
+        if ns is None:
+            missing.append(f"{label} ({reason})")
+            continue
+        ns = repair_split_like_jump(ns, label)
+        ns = ns[ns.index <= ed]
+        if ns.empty:
+            missing.append(f"{label} (no data on/before selected end date)")
+            continue
         color = COLORS[i % len(COLORS)]
         lw    = 1.8 if len(ns) > 500 else 2.0
-        ax_chart.plot(ns.index, ns.values, label=label,
-                      color=color, linewidth=lw, alpha=0.9)
+        if len(ns) == 1:
+            ax_chart.plot(ns.index, ns.values, label=label,
+                          color=color, linewidth=0.0, marker="o",
+                          markersize=4.5, alpha=0.95)
+        else:
+            ax_chart.plot(ns.index, ns.values, label=label,
+                          color=color, linewidth=lw, alpha=0.9)
         ax_chart.annotate(f"{ns.iloc[-1]:.1f}",
                           xy=(ns.index[-1], ns.iloc[-1]),
                           xytext=(5, 0), textcoords="offset points",
@@ -267,14 +444,13 @@ def redraw():
         plotted.append(label)
 
     ax_chart.axhline(bv, color="#999", lw=0.9, linestyle="--", alpha=0.6)
-    ax_chart.set_ylabel(f"Index  ({pd.Timestamp(bd).strftime('%Y-%m')} = {bv:.4g})",
+    ax_chart.set_ylabel(f"Index  ({pd.Timestamp(bd).strftime('%Y-%m-%d')} → {pd.Timestamp(ed).strftime('%Y-%m-%d')} = {bv:.4g})",
                         fontsize=9, color="#444")
     ax_chart.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
 
     # smart x-axis formatting by data span
-    freq = state["freq"]
     if plotted:
-        all_ns = [get_normalised(lb, rs, bd, bv) for lb in plotted]
+        all_ns = [get_normalised(lb, rs, bd, bv)[0] for lb in plotted]
         spans  = [(ns.index[-1] - ns.index[0]).days for ns in all_ns if ns is not None]
         span   = max(spans) if spans else 365
     else:
@@ -301,15 +477,29 @@ def redraw():
                         framealpha=0.88, edgecolor="#ccc", fancybox=True)
 
     # title bar
-    ax_title.cla(); ax_title.axis("off")
-    ax_title.text(0, 0.75,
+    ax_title.cla()
+    ax_title.axis("off")
+    ax_title.text(0, 0.78,
                   "G20 Major Markets: Equities · Gold · Silver · REITs",
                   fontsize=13, fontweight="bold", color="#1a1a2e")
-    ax_title.text(0, 0.1,
-                  f"JPY-denominated · {freq} data · "
-                  f"Base {pd.Timestamp(bd).strftime('%Y-%m')} = {bv:.4g} · "
+    ax_title.text(0, 0.28,
+                  f"JPY-denominated · {state['freq']} data · "
+                  f"Base {pd.Timestamp(bd).strftime('%Y-%m-%d')} = {bv:.4g} · "
                   f"Source: Yahoo Finance",
                   fontsize=8, color="#666")
+
+    if missing:
+        short = ", ".join(missing[:4])
+        if len(missing) > 4:
+            short += f" … (+{len(missing) - 4} more)"
+        ax_title.text(0, -0.15,
+                      f"Not drawn at this base date: {short}",
+                      fontsize=7.3, color="#b00020", clip_on=False)
+        bd_info.set_text(f"Selected: {pd.Timestamp(bd).strftime('%Y-%m-%d')} → {pd.Timestamp(ed).strftime('%Y-%m-%d')}  |  Missing: {len(missing)}")
+        bd_info.set_color("#b00020")
+    else:
+        bd_info.set_text(f"Selected: {pd.Timestamp(bd).strftime('%Y-%m-%d')} → {pd.Timestamp(ed).strftime('%Y-%m-%d')}  |  All selected series drawable")
+        bd_info.set_color("#666")
 
     fig.canvas.draw_idle()
 
@@ -322,28 +512,21 @@ def on_check(clicked):
 chk.on_clicked(on_check)
 
 def on_date_submit(text):
-    for fmt in ("%Y-%m", "%Y-%m-%d", "%Y/%m", "%Y/%m/%d"):
-        try:
-            parsed = pd.to_datetime(text.strip(), format=fmt)
-            break
-        except ValueError:
-            parsed = None
+    parsed = parse_date_text(text)
     if parsed is None:
-        bd_info.set_text("Invalid format — use YYYY-MM")
+        bd_info.set_text("Invalid format — use YYYY-MM or YYYY-MM-DD")
         bd_info.set_color("red")
         fig.canvas.draw_idle()
         return
-    earliest = state["earliest"]
-    if parsed < earliest:
-        parsed = earliest
-        tb_date.set_val(earliest.strftime("%Y-%m"))
-        bd_info.set_text(
-            f"Clamped to earliest: {earliest.strftime('%Y-%m')} ('{state['shortest']}')")
+
+    if parsed > state["end_date"]:
+        parsed = state["end_date"]
+        tb_date.set_val(parsed.strftime("%Y-%m-%d"))
+        bd_info.set_text("Base date clamped to end date")
         bd_info.set_color("#b85c00")
     else:
-        bd_info.set_text(
-            f"Earliest: {earliest.strftime('%Y-%m')}  (limited by '{state['shortest']}')")
         bd_info.set_color("#666")
+
     state["base_date"] = parsed
     redraw()
 tb_date.on_submit(on_date_submit)
@@ -358,20 +541,36 @@ def on_bval_submit(text):
         pass
 tb_bval.on_submit(on_bval_submit)
 
+def on_end_date_submit(text):
+    parsed = parse_date_text(text)
+    if parsed is None:
+        bd_info.set_text("Invalid end date — use YYYY-MM or YYYY-MM-DD")
+        bd_info.set_color("red")
+        fig.canvas.draw_idle()
+        return
+
+    if parsed < state["base_date"]:
+        state["end_date"] = state["base_date"]
+        tb_edate.set_val(state["base_date"].strftime("%Y-%m-%d"))
+        bd_info.set_text("End date clamped to base date")
+        bd_info.set_color("#b85c00")
+    else:
+        state["end_date"] = parsed
+        bd_info.set_color("#666")
+    redraw()
+
+tb_edate.on_submit(on_end_date_submit)
+
 def make_freq_cb(fname):
     def cb(event):
         state["freq"] = fname
         code = FREQ_CODES[fname]
         state["resampled"] = resample_series(code)
-        e, sk = earliest_base(state["resampled"])
-        state["earliest"] = e
+        e, sk = common_start(state["resampled"])
+        state["common_earliest"] = e
         state["shortest"] = sk
-        # clamp base_date
-        if state["base_date"] < e:
-            state["base_date"] = e
-            tb_date.set_val(e.strftime("%Y-%m"))
         bd_info.set_text(
-            f"Earliest: {e.strftime('%Y-%m')}  (limited by '{sk}')")
+            f"Common start: {e.strftime('%Y-%m')}  (limited by '{sk}')")
         bd_info.set_color("#666")
         # highlight active button
         for b, fn in zip(freq_btns, FREQ_OPTIONS):
@@ -391,7 +590,7 @@ def clear_all(event):
     for i, lb in enumerate(labels_list):
         if state["active"][lb]: chk.set_active(i)
 def save_png(event):
-    fname = f"g20_{state['freq'].lower()}_{pd.Timestamp(state['base_date']).strftime('%Y%m')}.png"
+    fname = f"g20_{state['freq'].lower()}_{pd.Timestamp(state['base_date']).strftime('%Y%m%d')}_to_{pd.Timestamp(state['end_date']).strftime('%Y%m%d')}.png"
     fig.savefig(fname, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     print(f"Saved: {fname}")
