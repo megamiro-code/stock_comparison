@@ -33,7 +33,7 @@ TICKERS = {
     "Nikkei 225":         ("^N225",                         "JPY"),
     # TOPIX can be unstable on Yahoo depending on the symbol.
     # Use the index first, then fall back to alternatives.
-    "TOPIX":              (("^TOPX", "^TPX", "1306.T"),     "JPY"),
+    "TOPIX":              (("^TPX", "^TOPX", "1306.T"),     "JPY"),
     "S&P 500":            ("^GSPC",                         "USD"),
     "DAX":             ("^GDAXI",     "EUR"),
     "FTSE 100":        ("^FTSE",      "GBP"),
@@ -58,6 +58,13 @@ FX_MAP = {
     "JPY": None,
 }
 
+# Some FX tickers on Yahoo can effectively be quoted in 100-unit terms
+# (most notably KRW in some data windows). Keep the Claude structure, but
+# normalize these cases so the JPY conversion stays stable.
+FX_UNIT_FACTOR = {
+    "KRW": 100.0,
+}
+
 def ticker_candidates(spec):
     """Return a list of ticker strings from a TICKERS entry."""
     if isinstance(spec, (tuple, list)):
@@ -67,6 +74,61 @@ def ticker_candidates(spec):
             return list(spec[0])
         return list(spec)
     return [spec]
+
+
+def pick_best_ticker(ticker_spec, raw_close: pd.DataFrame):
+    """Pick the candidate with enough history and the smoothest continuity.
+
+    This avoids unstable Yahoo symbols winning just because they appear first,
+    and reduces the chance of selecting a proxy series with a split-like jump.
+    """
+    best_ticker = None
+    best_score = None  # (usable_points, -big_jump_count, -max_jump, earliest_date)
+
+    for ticker in ticker_candidates(ticker_spec):
+        if ticker not in raw_close.columns:
+            continue
+        s = raw_close[ticker].dropna()
+        if len(s) < 2:
+            continue
+
+        pct = s.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        if pct.empty:
+            big_jump_count = 0
+            max_jump = 0.0
+        else:
+            # Penalize structural discontinuities heavily.
+            big_jump_count = int((pct.abs() > 0.35).sum())
+            max_jump = float(pct.abs().max())
+
+        score = (int(s.shape[0]), -big_jump_count, -max_jump, s.index[0])
+        if best_score is None or score > best_score:
+            best_score = score
+            best_ticker = ticker
+
+    return best_ticker
+
+def normalise_fx_series(fx: pd.Series, ccy: str) -> pd.Series:
+    """Convert a Yahoo FX series to JPY per 1 unit of the foreign currency.
+
+    Some Yahoo FX tickers are effectively quoted in 100-unit terms. For those
+    currencies we apply a factor so the equity series does not show artificial
+    jumps or level shifts.
+    """
+    fx = fx.dropna().copy()
+    factor = FX_UNIT_FACTOR.get(ccy, 1.0)
+
+    # Guardrail: if a low-value currency quote is clearly in 100-unit terms,
+    # force the correction even if the hard-coded factor is absent.
+    if ccy == "KRW" and len(fx) > 20:
+        med = float(fx.median())
+        if med > 1.0:
+            factor = 100.0
+
+    if factor != 1.0:
+        fx = fx / factor
+
+    return fx
 
 COLORS = [
     "#1f77b4","#d62728","#2ca02c","#ff7f0e","#9467bd",
@@ -102,11 +164,7 @@ if isinstance(raw_fx, pd.Series):
 # build daily JPY series (resample later per frequency)
 daily = {}
 for label, (ticker_spec, ccy) in TICKERS.items():
-    picked = None
-    for ticker in ticker_candidates(ticker_spec):
-        if ticker in raw_p.columns and not raw_p[ticker].dropna().empty:
-            picked = ticker
-            break
+    picked = pick_best_ticker(ticker_spec, raw_p)
     if picked is None:
         print(f"  [SKIP] {label} — no usable price series found")
         continue
@@ -122,7 +180,10 @@ for label, (ticker_spec, ccy) in TICKERS.items():
             print(f"  [SKIP] {label} — FX missing")
             continue
         fx = raw_fx[fx_col].reindex(s.index, method="ffill").dropna()
+        fx = normalise_fx_series(fx, ccy)
         s  = s.reindex(fx.index).dropna() * fx
+        if ccy in FX_UNIT_FACTOR or (ccy == "KRW" and len(fx) > 20):
+            print(f"    [FX]  {label} — applied unit factor correction")
 
     # Convert gold/silver futures from oz to gram after JPY conversion
     if label in ("Gold (JPY/g)", "Silver (JPY/g)"):
@@ -149,7 +210,7 @@ def resample_series(freq_code):
             r = s.resample("W-FRI").last().dropna()
         else:  # ME
             r = s.resample("ME").last().dropna()
-        if len(r) >= 2:
+        if len(r) >= 1:
             out[lb] = r
     return out
 
@@ -191,6 +252,44 @@ def parse_date_text(text):
         return pd.to_datetime(text)
     except Exception:
         return None
+
+
+def repair_split_like_jump(series: pd.Series, label: str) -> pd.Series:
+    """If a series has a single huge discontinuity, stitch the later segment.
+
+    This is a conservative repair for proxy series such as TOPIX ETFs where
+    Yahoo sometimes serves a split-like jump that is not part of the market move.
+    """
+    if len(series) < 10:
+        return series
+
+    pct = series.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if pct.empty:
+        return series
+
+    # Only intervene when the jump is clearly structural.
+    jump_idx = pct.abs().idxmax()
+    jump_mag = float(abs(pct.loc[jump_idx]))
+    if jump_mag < 0.70:
+        return series
+
+    pos = series.index.get_indexer([jump_idx])[0]
+    if pos <= 0 or pos >= len(series) - 1:
+        return series
+
+    prev_val = float(series.iloc[pos - 1])
+    curr_val = float(series.iloc[pos])
+
+    if prev_val <= 0 or curr_val <= 0:
+        return series
+
+    # If this looks like a step change, rescale the post-jump segment.
+    factor = prev_val / curr_val
+    repaired = series.copy()
+    repaired.iloc[pos:] = repaired.iloc[pos:] * factor
+
+    print(f"  [FIX]  {label} — stitched split-like jump at {jump_idx.date()} (x{factor:.4g})")
+    return repaired
 
 
 # ══════════════════════════════════════════════
@@ -324,14 +423,20 @@ def redraw():
         if ns is None:
             missing.append(f"{label} ({reason})")
             continue
+        ns = repair_split_like_jump(ns, label)
         ns = ns[ns.index <= ed]
         if ns.empty:
             missing.append(f"{label} (no data on/before selected end date)")
             continue
         color = COLORS[i % len(COLORS)]
         lw    = 1.8 if len(ns) > 500 else 2.0
-        ax_chart.plot(ns.index, ns.values, label=label,
-                      color=color, linewidth=lw, alpha=0.9)
+        if len(ns) == 1:
+            ax_chart.plot(ns.index, ns.values, label=label,
+                          color=color, linewidth=0.0, marker="o",
+                          markersize=4.5, alpha=0.95)
+        else:
+            ax_chart.plot(ns.index, ns.values, label=label,
+                          color=color, linewidth=lw, alpha=0.9)
         ax_chart.annotate(f"{ns.iloc[-1]:.1f}",
                           xy=(ns.index[-1], ns.iloc[-1]),
                           xytext=(5, 0), textcoords="offset points",
