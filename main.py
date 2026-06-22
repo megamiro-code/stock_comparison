@@ -25,13 +25,13 @@ BASE_VALUE   = 100
 FETCH_START  = "2000-01-01"
 FETCH_END    = date.today().strftime("%Y-%m-%d")
 
-# Resample frequency: "D"=daily  "W"=weekly  "ME"=monthly
-RESAMPLE_FREQ = "W"   # weekly by default; change to "D" for daily (slower)
+# Resample frequency: "Daily" / "Weekly" / "Monthly"
+RESAMPLE_FREQ = "Weekly"   # default; must match a key in FREQ_CODES below
 
 TICKERS = {
     # label              ticker        currency
     "Nikkei 225":      ("^N225",      "JPY"),
-    "TOPIX":           ("^TOPX",      "JPY"),   # longer history than N225 on YF
+    "TOPIX (1306.T)":  ("1306.T",     "JPY"),   # TOPIX ETF — proxy for TOPIX
     "S&P 500":         ("^GSPC",      "USD"),
     "DAX":             ("^GDAXI",     "EUR"),
     "FTSE 100":        ("^FTSE",      "GBP"),
