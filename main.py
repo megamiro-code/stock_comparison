@@ -1,237 +1,383 @@
 """
-G20 Major Market Indices + Gold, Silver, REITs — Normalized Chart
-==================================================================
-Requirements:
-  pip install yfinance matplotlib pandas numpy
+G20 Major Markets — Interactive Chart
+======================================
+pip install yfinance matplotlib pandas numpy mplcursors
 
-Usage:
-  python g20_market_chart.py
-
-Customization:
-  - BASE_VALUE : normalization base (default 100)
-  - START_DATE / END_DATE : override date range (None = auto)
-  - The script auto-detects the shortest available series and sets
-    the base date to the first common trading day across all tickers.
+Run:  python g20_market_chart.py
 """
 
-import warnings
+import warnings, sys
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import matplotlib.dates as mdates
-import yfinance as yf
+import matplotlib.ticker as mticker
+from matplotlib.widgets import CheckButtons, Button, TextBox
 from datetime import date, timedelta
+import yfinance as yf
 
-# ══════════════════════════════════════════════════
-#  USER SETTINGS  — edit these freely
-# ══════════════════════════════════════════════════
-BASE_VALUE  = 100          # Normalisation base (e.g. 100, 1000, 10000)
-START_DATE  = "2024-01-01" # Fetch start — set None to use 2 years ago
-END_DATE    = None         # Fetch end   — set None to use today
-JPY_BASE    = True         # True = convert all prices to JPY
-# ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════
+#  SETTINGS
+# ══════════════════════════════════════════════
+BASE_VALUE  = 100
+FETCH_START = "2020-01-01"   # fetch extra history for flexible base-date
+FETCH_END   = date.today().strftime("%Y-%m-%d")
 
-# ── Date range ────────────────────────────────────
-today = date.today()
-if END_DATE is None:
-    END_DATE = today.strftime("%Y-%m-%d")
-if START_DATE is None:
-    START_DATE = (today - timedelta(days=365*2 + 60)).strftime("%Y-%m-%d")
-
-# ── Tickers ───────────────────────────────────────
-# Format: "Display Label": ("ticker", "currency_of_ticker")
 TICKERS = {
-    # Equities — G20 + key markets
-    "Nikkei 225 (JP)":        ("^N225",       "JPY"),
-    "S&P 500 (US)":           ("^GSPC",       "USD"),
-    "DAX (DE)":               ("^GDAXI",      "EUR"),
-    "FTSE 100 (UK)":          ("^FTSE",       "GBP"),
-    "CAC 40 (FR)":            ("^FCHI",       "EUR"),
-    "Shanghai Comp. (CN)":    ("000001.SS",   "CNY"),
-    "SENSEX (IN)":            ("^BSESN",      "INR"),
-    "KOSPI (KR)":             ("^KS11",       "KRW"),
-    "IBOVESPA (BR)":          ("^BVSP",       "BRL"),
-    "ASX 200 (AU)":           ("^AXJO",       "AUD"),
-    "TSX (CA)":               ("^GSPTSE",     "CAD"),
-    "FTSE MIB (IT)":          ("FTSEMIB.MI",  "EUR"),
-    # Commodities
-    "Gold (JPY/g)":           ("GC=F",        "USD"),  # USD/oz → JPY/g
-    "Silver (JPY/g)":         ("SI=F",        "USD"),  # USD/oz → JPY/g
-    # REITs
-    "J-REIT Index (JP)":      ("1343.T",      "JPY"),  # NEXT FUNDS J-REIT ETF
-    "US REIT (VNQ, JPY)":     ("VNQ",         "USD"),
-    "Asia REIT (3269.T, JPY)":("3269.T",      "JPY"),  # Hoshino Resorts REIT
+    "Nikkei 225":        ("^N225",      "JPY"),
+    "S&P 500":           ("^GSPC",      "USD"),
+    "DAX":               ("^GDAXI",     "EUR"),
+    "FTSE 100":          ("^FTSE",      "GBP"),
+    "CAC 40":            ("^FCHI",      "EUR"),
+    "Shanghai Comp.":    ("000001.SS",  "CNY"),
+    "SENSEX":            ("^BSESN",     "INR"),
+    "KOSPI":             ("^KS11",      "KRW"),
+    "IBOVESPA":          ("^BVSP",      "BRL"),
+    "ASX 200":           ("^AXJO",      "AUD"),
+    "TSX":               ("^GSPTSE",    "CAD"),
+    "FTSE MIB":          ("FTSEMIB.MI", "EUR"),
+    "Gold (JPY/g)":      ("GC=F",       "USD"),
+    "Silver (JPY/g)":    ("SI=F",       "USD"),
+    "J-REIT":            ("1343.T",     "JPY"),
+    "US REIT (VNQ)":     ("VNQ",        "USD"),
 }
 
-FX_TICKERS = {
-    "USD": "JPY=X",
-    "EUR": "EURJPY=X",
-    "GBP": "GBPJPY=X",
-    "AUD": "AUDJPY=X",
-    "CAD": "CADJPY=X",
-    "CNY": "CNYJPY=X",
-    "INR": "INRJPY=X",
-    "KRW": "KRWJPY=X",
-    "BRL": "BRLJPY=X",
+FX_MAP = {
+    "USD": "JPY=X", "EUR": "EURJPY=X", "GBP": "GBPJPY=X",
+    "AUD": "AUDJPY=X", "CAD": "CADJPY=X", "CNY": "CNYJPY=X",
+    "INR": "INRJPY=X", "KRW": "KRWJPY=X", "BRL": "BRLJPY=X",
     "JPY": None,
 }
 
-TROY_OZ_TO_GRAM = 31.1035  # 1 troy oz = 31.1035 g
+COLORS = [
+    "#1f77b4","#d62728","#2ca02c","#ff7f0e","#9467bd",
+    "#8c564b","#e377c2","#17becf","#bcbd22","#7f7f7f",
+    "#393b79","#637939","#843c39","#7b4173","#5254a3",
+    "#3182bd",
+]
 
-GROUPS = {
-    "Equities — Developed":  ["Nikkei 225 (JP)","S&P 500 (US)","DAX (DE)","FTSE 100 (UK)",
-                               "CAC 40 (FR)","ASX 200 (AU)","TSX (CA)","FTSE MIB (IT)"],
-    "Equities — Emerging":   ["Shanghai Comp. (CN)","SENSEX (IN)","KOSPI (KR)","IBOVESPA (BR)"],
-    "Commodities":           ["Gold (JPY/g)","Silver (JPY/g)"],
-    "REITs":                 ["J-REIT Index (JP)","US REIT (VNQ, JPY)","Asia REIT (3269.T, JPY)"],
-}
+TROY_TO_G = 31.1035
 
-GROUP_COLORS = {
-    "Equities — Developed": ["#1f4e79","#2e75b6","#5ba3d9","#9dc3e6",
-                              "#c55a11","#ed7d31","#ffc000","#70ad47"],
-    "Equities — Emerging":  ["#c00000","#ff4444","#ff9999","#ffcccc"],
-    "Commodities":          ["#b8860b","#999999"],
-    "REITs":                ["#375623","#70ad47","#a9d18e"],
-}
+# ══════════════════════════════════════════════
+#  1. DOWNLOAD DATA
+# ══════════════════════════════════════════════
+print("Downloading price data…")
 
-# ── Download price data ───────────────────────────
-print("Downloading price data...")
-all_tickers = list({t for t, _ in TICKERS.values()})
-fx_needed   = list({FX_TICKERS[c] for _, c in TICKERS.values() if c != "JPY"})
+all_t  = list({t for t,_ in TICKERS.values()})
+fx_t   = list({FX_MAP[c] for _,c in TICKERS.values() if c != "JPY"})
 
-raw_prices = yf.download(all_tickers, start=START_DATE, end=END_DATE,
-                          progress=True, auto_adjust=True)["Close"]
-raw_fx     = yf.download(fx_needed,   start=START_DATE, end=END_DATE,
-                          progress=False, auto_adjust=True)["Close"]
+raw_p  = yf.download(all_t,  start=FETCH_START, end=FETCH_END, progress=True,  auto_adjust=True)["Close"]
+raw_fx = yf.download(fx_t,   start=FETCH_START, end=FETCH_END, progress=False, auto_adjust=True)["Close"]
 
-# Ensure DataFrame even for single ticker
-if isinstance(raw_prices, pd.Series):
-    raw_prices = raw_prices.to_frame(name=all_tickers[0])
-if isinstance(raw_fx, pd.Series):
-    raw_fx = raw_fx.to_frame(name=fx_needed[0])
+if isinstance(raw_p,  pd.Series): raw_p  = raw_p.to_frame(name=all_t[0])
+if isinstance(raw_fx, pd.Series): raw_fx = raw_fx.to_frame(name=fx_t[0])
 
-# ── Build JPY-denominated monthly series ─────────
-monthly_series = {}
-
-for label, (ticker, currency) in TICKERS.items():
-    if ticker not in raw_prices.columns:
-        print(f"  [SKIP] {label}: ticker not found")
+# build monthly JPY series
+monthly = {}
+for label, (ticker, ccy) in TICKERS.items():
+    if ticker not in raw_p.columns:
+        print(f"  [SKIP] {label}")
         continue
-
-    price = raw_prices[ticker].dropna()
-    if price.empty:
-        print(f"  [SKIP] {label}: no data")
-        continue
-
-    # Convert to JPY
-    if currency != "JPY":
-        fx_ticker = FX_TICKERS[currency]
-        if fx_ticker not in raw_fx.columns:
-            print(f"  [SKIP] {label}: FX rate not found")
-            continue
-        fx = raw_fx[fx_ticker].reindex(price.index, method="ffill").dropna()
-        price = price.reindex(fx.index).dropna() * fx
-    
-    # Gold / Silver: USD/oz → JPY/g
+    s = raw_p[ticker].dropna()
+    if s.empty: continue
+    if ccy != "JPY":
+        fx_col = FX_MAP[ccy]
+        if fx_col not in raw_fx.columns: continue
+        fx = raw_fx[fx_col].reindex(s.index, method="ffill").dropna()
+        s  = s.reindex(fx.index).dropna() * fx
     if label in ("Gold (JPY/g)", "Silver (JPY/g)"):
-        price = price / TROY_OZ_TO_GRAM
+        s = s / TROY_TO_G
+    m = s.resample("ME").last().dropna()
+    if len(m) >= 3:
+        monthly[label] = m
+        print(f"  [OK]  {label}: {m.index[0].date()} — {m.index[-1].date()}")
 
-    # Resample to month-end
-    monthly = price.resample("ME").last().dropna()
-    if len(monthly) < 3:
-        print(f"  [SKIP] {label}: insufficient data ({len(monthly)} months)")
-        continue
+if not monthly:
+    sys.exit("No data. Check internet / yfinance installation.")
 
-    monthly_series[label] = monthly
-    print(f"  [OK]   {label}: {monthly.index[0].date()} to {monthly.index[-1].date()} ({len(monthly)} months)")
+# ══════════════════════════════════════════════
+#  2. COMMON DATE LOGIC
+# ══════════════════════════════════════════════
+# The earliest possible base date = start of the shortest series
+first_dates   = {k: v.index[0] for k,v in monthly.items()}
+shortest_key  = max(first_dates, key=lambda k: first_dates[k])
+EARLIEST_BASE = first_dates[shortest_key]     # can't go earlier than this
 
-if not monthly_series:
-    raise RuntimeError("No data downloaded. Check your internet connection and yfinance installation.")
+print(f"\nShortest series : '{shortest_key}' from {EARLIEST_BASE.date()}")
 
-# ── Find common start date (shortest series) ──────
-first_dates = {k: s.index[0] for k, s in monthly_series.items()}
-common_start = max(first_dates.values())  # latest first date = common start
+labels_list = list(monthly.keys())
+# default: show Nikkei + S&P + Gold
+DEFAULT_ON = {"Nikkei 225", "S&P 500", "Gold (JPY/g)"}
 
-shortest = max(first_dates, key=lambda k: first_dates[k])
-print(f"\nShortest series: '{shortest}' starting {first_dates[shortest].date()}")
-print(f"Common base date set to: {common_start.date()} (BASE_VALUE = {BASE_VALUE})")
-
-# ── Normalise from common_start ───────────────────
-normalised = {}
-for label, series in monthly_series.items():
-    clipped = series[series.index >= common_start]
-    if clipped.empty:
-        continue
-    base = clipped.iloc[0]
-    normalised[label] = (clipped / base * BASE_VALUE)
-
-# ── Plot ──────────────────────────────────────────
-fig, axes = plt.subplots(2, 2, figsize=(20, 13))
+# ══════════════════════════════════════════════
+#  3. FIGURE LAYOUT
+# ══════════════════════════════════════════════
+fig = plt.figure(figsize=(18, 9))
 fig.patch.set_facecolor("#f8f9fa")
 
-base_label = common_start.strftime("%b %Y")
-fig.suptitle(
-    f"G20 Major Markets: Equities, Gold, Silver & REITs  |  "
-    f"Base = {BASE_VALUE} ({base_label})  |  JPY-denominated",
-    fontsize=14, fontweight="bold", y=0.99
+# --- axes proportions ---
+# left panel: checkboxes  |  right: chart  |  top: controls
+ax_chart  = fig.add_axes([0.22, 0.13, 0.76, 0.74])  # main chart
+ax_checks = fig.add_axes([0.01, 0.13, 0.19, 0.74])  # checkbox panel
+ax_title  = fig.add_axes([0.22, 0.89, 0.76, 0.08])  # title area (no frame)
+ax_title.axis("off")
+
+ax_chart.set_facecolor("#ffffff")
+ax_chart.spines[["top","right"]].set_visible(False)
+ax_chart.spines[["left","bottom"]].set_color("#cccccc")
+ax_chart.grid(axis="y", linestyle="--", lw=0.6, color="#e0e0e0", alpha=0.8)
+ax_chart.grid(axis="x", linestyle=":",  lw=0.4, color="#e8e8e8", alpha=0.6)
+
+ax_checks.set_facecolor("#f0f0f0")
+ax_checks.set_title("Select indices", fontsize=9, pad=4, color="#333")
+
+# --- TextBox for base-date ---
+ax_tb_label = fig.add_axes([0.22, 0.05, 0.10, 0.05])
+ax_tb_label.axis("off")
+ax_tb_label.text(1.0, 0.5, "Base date\n(YYYY-MM):",
+                 ha="right", va="center", fontsize=8, color="#444")
+
+ax_textbox = fig.add_axes([0.33, 0.055, 0.13, 0.04])
+textbox = TextBox(ax_textbox, "", initial=EARLIEST_BASE.strftime("%Y-%m"))
+
+ax_base_info = fig.add_axes([0.47, 0.05, 0.30, 0.05])
+ax_base_info.axis("off")
+base_info_txt = ax_base_info.text(
+    0.0, 0.5,
+    f"Earliest available: {EARLIEST_BASE.strftime('%Y-%m')}  "
+    f"(limited by '{shortest_key}')",
+    va="center", fontsize=7.5, color="#666"
 )
 
-axes_flat = axes.flatten()
+# --- Base-value TextBox ---
+ax_bv_label = fig.add_axes([0.77, 0.05, 0.08, 0.05])
+ax_bv_label.axis("off")
+ax_bv_label.text(1.0, 0.5, "Base value:", ha="right", va="center",
+                 fontsize=8, color="#444")
 
-for ax_i, (group_name, labels) in enumerate(GROUPS.items()):
-    ax = axes_flat[ax_i]
-    ax.set_facecolor("#ffffff")
-    ax.spines[["top","right"]].set_visible(False)
-    ax.spines[["left","bottom"]].set_color("#cccccc")
-    ax.grid(axis="y", linestyle="--", linewidth=0.6, color="#e0e0e0", alpha=0.8)
-    ax.grid(axis="x", linestyle=":",  linewidth=0.4, color="#e8e8e8", alpha=0.6)
+ax_bv_box = fig.add_axes([0.86, 0.055, 0.07, 0.04])
+bv_textbox = TextBox(ax_bv_box, "", initial=str(BASE_VALUE))
 
-    colors = GROUP_COLORS[group_name]
-    plotted = 0
+# ══════════════════════════════════════════════
+#  4. STATE
+# ══════════════════════════════════════════════
+state = {
+    "base_date":  EARLIEST_BASE,
+    "base_value": BASE_VALUE,
+    "active":     {lb: (lb in DEFAULT_ON) for lb in labels_list},
+    "lines":      {},
+    "legend":     None,
+}
 
-    for j, label in enumerate(labels):
-        if label not in normalised:
+# ══════════════════════════════════════════════
+#  5. DRAW / REDRAW CHART
+# ══════════════════════════════════════════════
+def get_normalised(label):
+    """Return normalised series from state['base_date'], or None."""
+    s = monthly[label]
+    bd = state["base_date"]
+    bv = state["base_value"]
+    clipped = s[s.index >= bd]
+    if clipped.empty:
+        return None
+    base = clipped.iloc[0]
+    if base == 0:
+        return None
+    return clipped / base * bv
+
+def redraw():
+    ax_chart.cla()
+    ax_chart.set_facecolor("#ffffff")
+    ax_chart.spines[["top","right"]].set_visible(False)
+    ax_chart.spines[["left","bottom"]].set_color("#cccccc")
+    ax_chart.grid(axis="y", linestyle="--", lw=0.6, color="#e0e0e0", alpha=0.8)
+    ax_chart.grid(axis="x", linestyle=":",  lw=0.4, color="#e8e8e8", alpha=0.6)
+
+    bd  = state["base_date"]
+    bv  = state["base_value"]
+    plotted = []
+
+    for i, label in enumerate(labels_list):
+        if not state["active"][label]:
             continue
-        s = normalised[label]
-        color = colors[j % len(colors)]
-        lw = 2.2 if j < 2 else 1.6
-        ax.plot(s.index, s.values, label=label, color=color,
-                linewidth=lw, alpha=0.92)
-        # Annotate last value
-        ax.annotate(f"{s.iloc[-1]:.1f}",
-                    xy=(s.index[-1], s.iloc[-1]),
-                    xytext=(5, 0), textcoords="offset points",
-                    fontsize=7.5, color=color, fontweight="bold", va="center")
-        plotted += 1
+        ns = get_normalised(label)
+        if ns is None:
+            continue
+        color = COLORS[i % len(COLORS)]
+        line, = ax_chart.plot(ns.index, ns.values,
+                              label=label, color=color,
+                              linewidth=2.0, alpha=0.9)
+        # annotate last value
+        ax_chart.annotate(f"{ns.iloc[-1]:.1f}",
+                          xy=(ns.index[-1], ns.iloc[-1]),
+                          xytext=(5, 0), textcoords="offset points",
+                          fontsize=7, color=color, fontweight="bold", va="center")
+        plotted.append(label)
 
-    ax.axhline(BASE_VALUE, color="#888", linewidth=0.9, linestyle="--", alpha=0.6)
+    # base line
+    ax_chart.axhline(bv, color="#999", linewidth=0.9, linestyle="--", alpha=0.7)
 
-    ax.set_title(group_name, fontsize=12, fontweight="bold", pad=8)
-    ax.set_ylabel(f"Index ({base_label} = {BASE_VALUE})", fontsize=9, color="#444")
-    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y/%m"))
-    ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 7]))
-    plt.setp(ax.get_xticklabels(), rotation=30, fontsize=8)
+    ax_chart.set_ylabel(f"Index  ({bd.strftime('%Y-%m')} = {bv})",
+                        fontsize=9, color="#444")
+    ax_chart.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
+    ax_chart.xaxis.set_major_formatter(mdates.DateFormatter("%Y/%m"))
+    ax_chart.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+    plt.setp(ax_chart.get_xticklabels(), rotation=30, fontsize=8)
+    plt.setp(ax_chart.get_yticklabels(), fontsize=8)
 
-    if plotted > 0:
-        ax.legend(loc="upper left", fontsize=8, framealpha=0.85,
-                  edgecolor="#cccccc", fancybox=True)
+    if plotted:
+        ax_chart.legend(loc="upper left", fontsize=8,
+                        framealpha=0.88, edgecolor="#ccc", fancybox=True)
+
+    # update title
+    ax_title.cla(); ax_title.axis("off")
+    ax_title.text(0.0, 0.7,
+                  "G20 Major Markets: Equities · Gold · Silver · REITs",
+                  fontsize=13, fontweight="bold", color="#1a1a2e")
+    ax_title.text(0.0, 0.1,
+                  f"JPY-denominated · Month-end · Base {bd.strftime('%Y-%m')} = {bv} "
+                  f"· Source: Yahoo Finance",
+                  fontsize=8, color="#666")
+
+    fig.canvas.draw_idle()
+
+# ══════════════════════════════════════════════
+#  6. CHECKBOXES
+# ══════════════════════════════════════════════
+check_init = [state["active"][lb] for lb in labels_list]
+chk = CheckButtons(ax_checks, labels_list, check_init)
+
+# style checkbox labels
+for text_obj in chk.labels:
+    text_obj.set_fontsize(8)
+    text_obj.set_color("#222")
+
+def on_check(clicked_label):
+    state["active"][clicked_label] = not state["active"][clicked_label]
+    redraw()
+
+chk.on_clicked(on_check)
+
+# ══════════════════════════════════════════════
+#  7. BASE-DATE TEXTBOX
+# ══════════════════════════════════════════════
+def on_basedate_submit(text):
+    text = text.strip()
+    # accept YYYY-MM or YYYY-MM-DD
+    for fmt in ("%Y-%m", "%Y-%m-%d", "%Y/%m", "%Y/%m/%d"):
+        try:
+            parsed = pd.to_datetime(text, format=fmt)
+            break
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        ax_base_info.cla(); ax_base_info.axis("off")
+        ax_base_info.text(0, 0.5, "Invalid date format. Use YYYY-MM.",
+                          va="center", fontsize=7.5, color="red")
+        fig.canvas.draw_idle()
+        return
+
+    parsed = parsed.normalize()
+    # clamp to EARLIEST_BASE
+    if parsed < EARLIEST_BASE:
+        parsed = EARLIEST_BASE
+        textbox.set_val(EARLIEST_BASE.strftime("%Y-%m"))
+        ax_base_info.cla(); ax_base_info.axis("off")
+        ax_base_info.text(0, 0.5,
+                          f"Clamped to earliest available: "
+                          f"{EARLIEST_BASE.strftime('%Y-%m')} ('{shortest_key}')",
+                          va="center", fontsize=7.5, color="#b85c00")
+        fig.canvas.draw_idle()
     else:
-        ax.text(0.5, 0.5, "No data available", transform=ax.transAxes,
-                ha="center", va="center", color="#888", fontsize=11)
+        ax_base_info.cla(); ax_base_info.axis("off")
+        ax_base_info.text(0, 0.5,
+                          f"Earliest available: {EARLIEST_BASE.strftime('%Y-%m')} "
+                          f"(limited by '{shortest_key}')",
+                          va="center", fontsize=7.5, color="#666")
+        fig.canvas.draw_idle()
 
-# ── Footer ────────────────────────────────────────
-fig.text(0.01, 0.005,
-         f"Source: Yahoo Finance via yfinance  |  Month-end prices  |  "
-         f"Generated {today}  |  Gold & Silver converted to JPY/g",
-         fontsize=7.5, color="#777")
+    state["base_date"] = parsed
+    redraw()
 
-plt.tight_layout(rect=[0, 0.015, 1, 0.975])
+textbox.on_submit(on_basedate_submit)
 
-out = "g20_market_comparison.png"
-plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+# ══════════════════════════════════════════════
+#  8. BASE-VALUE TEXTBOX
+# ══════════════════════════════════════════════
+def on_basevalue_submit(text):
+    try:
+        v = float(text.strip())
+        if v <= 0: raise ValueError
+        state["base_value"] = v
+        redraw()
+    except ValueError:
+        pass
+
+bv_textbox.on_submit(on_basevalue_submit)
+
+# ══════════════════════════════════════════════
+#  9. SELECT-ALL / CLEAR BUTTONS
+# ══════════════════════════════════════════════
+ax_btn_all   = fig.add_axes([0.01, 0.06, 0.09, 0.04])
+ax_btn_clear = fig.add_axes([0.11, 0.06, 0.09, 0.04])
+
+btn_all   = Button(ax_btn_all,   "Select All",  color="#ddeeff", hovercolor="#bbddff")
+btn_clear = Button(ax_btn_clear, "Clear All",   color="#ffeedd", hovercolor="#ffccbb")
+
+def on_select_all(event):
+    for lb in labels_list:
+        if not state["active"][lb]:
+            state["active"][lb] = True
+            # sync checkbox widget
+            idx = labels_list.index(lb)
+            chk.set_active(idx)   # toggles the visual, but also fires on_check again
+    redraw()
+
+def on_clear_all(event):
+    for lb in labels_list:
+        if state["active"][lb]:
+            state["active"][lb] = False
+            idx = labels_list.index(lb)
+            chk.set_active(idx)
+    redraw()
+
+# Use a simpler approach: directly toggle checkboxes via rectangles
+def select_all(event):
+    for i, lb in enumerate(labels_list):
+        if not state["active"][lb]:
+            chk.set_active(i)
+
+def clear_all(event):
+    for i, lb in enumerate(labels_list):
+        if state["active"][lb]:
+            chk.set_active(i)
+
+btn_all.on_clicked(select_all)
+btn_clear.on_clicked(clear_all)
+
+# ══════════════════════════════════════════════
+#  10. SAVE BUTTON
+# ══════════════════════════════════════════════
+ax_btn_save = fig.add_axes([0.87, 0.01, 0.11, 0.04])
+btn_save    = Button(ax_btn_save, "Save PNG", color="#ddeedd", hovercolor="#bbddbb")
+
+def save_chart(event):
+    fname = f"g20_chart_{state['base_date'].strftime('%Y%m')}.png"
+    fig.savefig(fname, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print(f"Saved: {fname}")
+
+btn_save.on_clicked(save_chart)
+
+# ══════════════════════════════════════════════
+#  11. INITIAL DRAW
+# ══════════════════════════════════════════════
+redraw()
+
+fig.text(0.01, 0.01,
+         f"Data: Yahoo Finance · Generated {date.today()} · All prices in JPY",
+         fontsize=6.5, color="#aaa")
+
 plt.show()
-print(f"\nSaved: {out}")
