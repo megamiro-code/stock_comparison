@@ -54,19 +54,19 @@ COLORS = [
 ]
 
 TICKERS = {
-    "Nikkei 225":        ("^N225",       "JPY"),
-    "TOPIX (1306.T)":    ("1306.T",      "JPY"),
-    "S&P 500":           ("^GSPC",       "USD"),
-    "DAX":               ("^GDAXI",      "EUR"),
-    "FTSE 100":          ("^FTSE",       "GBP"),
-    "CAC 40":            ("^FCHI",       "EUR"),
-    "Shanghai Comp.":    ("000001.SS",   "CNY"),
-    "SENSEX":            ("^BSESN",      "INR"),
-    "KOSPI":             ("^KS11",       "KRW"),
-    "IBOVESPA":          ("^BVSP",       "BRL"),
-    "ASX 200":           ("^AXJO",       "AUD"),
-    "TSX":               ("^GSPTSE",     "CAD"),
-    "FTSE MIB":          ("FTSEMIB.MI",  "EUR"),
+    "Nikkei 225 (Japan)":        ("^N225",       "JPY"),
+    "TOPIX (Japan)":    ("1306.T",      "JPY"),
+    "S&P 500 (USA)":           ("^GSPC",       "USD"),
+    "DAX (Germany)":               ("^GDAXI",      "EUR"),
+    "FTSE 100 (UK)":          ("^FTSE",       "GBP"),
+    "CAC 40 (France)":            ("^FCHI",       "EUR"),
+    "Shanghai Comp. (China)":    ("000001.SS",   "CNY"),
+    "SENSEX (India)":            ("^BSESN",      "INR"),
+    "KOSPI (South Korea)":             ("^KS11",       "KRW"),
+    "IBOVESPA (Brasil)":          ("^BVSP",       "BRL"),
+    "ASX 200 (Australia)":           ("^AXJO",       "AUD"),
+    "TSX (Canada)":               ("^GSPTSE",     "CAD"),
+    "FTSE MIB (Italy)":          ("FTSEMIB.MI",  "EUR"),
     "Gold (JPY/g)":      ("GC=F",        "USD"),
     "Silver (JPY/g)":    ("SI=F",        "USD"),
     "J-REIT":            ("1343.T",      "JPY"),
@@ -81,7 +81,7 @@ FX_MAP = {
 }
 
 TROY_TO_G    = 31.1035
-DEFAULT_ON   = {"Nikkei 225", "S&P 500", "Gold (JPY/g)"}
+DEFAULT_ON   = {"Nikkei 225 (Japan)", "S&P 500 (USA)"}
 FREQ_OPTIONS = ["Daily", "Weekly", "Monthly"]
 FREQ_CODES   = {"Daily": "D", "Weekly": "W-FRI", "Monthly": "ME"}
 
