@@ -86,6 +86,128 @@ FREQ_OPTIONS = ["Daily", "Weekly", "Monthly"]
 FREQ_CODES   = {"Daily": "D", "Weekly": "W-FRI", "Monthly": "ME"}
 
 # ══════════════════════════════════════════════
+#  DATA CLEANING HELPERS
+# ══════════════════════════════════════════════
+# How large a single-day move must be to be considered a level-shift
+# (not a genuine market move).  30% is aggressive enough to catch
+# Yahoo unit-change artifacts while being safe for EM markets.
+STITCH_THRESHOLD = 0.30   # 30 % single-period jump triggers stitching
+
+def _remove_spikes(s: pd.Series) -> pd.Series:
+    """Remove isolated single-bar outliers.
+
+    A bar is an outlier when ALL of the following hold:
+      • |pct_change| from the previous bar > 40 %
+      • |pct_change| back to the next bar  > 40 %  (i.e. it reverts)
+      • The move to the next bar is in the opposite direction
+    This targets genuine single-day data errors without touching
+    persistent level shifts (which are handled by _stitch_level_shifts).
+    """
+    if len(s) < 3:
+        return s
+    vals  = s.values.copy().astype(float)
+    dates = s.index
+    mask  = np.ones(len(vals), dtype=bool)
+    for i in range(1, len(vals) - 1):
+        prev, cur, nxt = vals[i-1], vals[i], vals[i+1]
+        if prev <= 0 or cur <= 0 or nxt <= 0:
+            continue
+        r1 = (cur - prev) / prev   # prev → cur
+        r2 = (nxt - cur)  / cur    # cur  → nxt
+        # spike: big move then full reversal
+        if abs(r1) > 0.40 and abs(r2) > 0.40 and (r1 * r2 < 0):
+            mask[i] = False
+    removed = (~mask).sum()
+    if removed:
+        print(f"    [CLEAN] removed {removed} isolated spike(s)")
+    return pd.Series(vals[mask], index=dates[mask])
+
+
+def _stitch_level_shifts(s: pd.Series, label: str) -> pd.Series:
+    """Detect and repair permanent level-shifts in a price series.
+
+    Yahoo Finance sometimes changes the unit or base of an index
+    mid-series (e.g. TOPIX ÷100, KOSPI re-denomination).  This shows
+    up as a single large jump that is *not* reversed the next day.
+
+    Strategy
+    --------
+    1. Scan for day-over-day |pct| > STITCH_THRESHOLD.
+    2. For each candidate jump, check whether the surrounding
+       30-bar windows have similar *volatility* — a genuine crash has
+       elevated vol on both sides, an artifact jump does not.
+    3. If identified as an artifact, rescale the segment BEFORE the
+       jump so the series is continuous (preserving the most-recent
+       level as the "truth").
+    """
+    if len(s) < 10:
+        return s
+
+    s = s.copy()
+    vals  = s.values.astype(float)
+    n     = len(vals)
+    W     = 30          # window for vol comparison
+
+    # Iterate from oldest to newest so each fix propagates correctly.
+    # We re-compute pct after each repair.
+    max_passes = 10
+    for _ in range(max_passes):
+        pct   = np.diff(vals) / np.abs(vals[:-1])
+        pct   = np.where(np.isfinite(pct), pct, 0.0)
+        jumps = np.where(np.abs(pct) > STITCH_THRESHOLD)[0]
+        if len(jumps) == 0:
+            break
+
+        fixed_any = False
+        for idx in jumps:
+            # idx is the index of the bar *before* the jump;
+            # the jump happens between vals[idx] and vals[idx+1].
+            before_start = max(0,   idx - W)
+            after_end    = min(n-1, idx + 1 + W)
+
+            before_seg = vals[before_start : idx + 1]
+            after_seg  = vals[idx + 1 : after_end + 1]
+
+            if len(before_seg) < 3 or len(after_seg) < 3:
+                continue
+
+            # Normalised volatility (std of log-returns)
+            def _vol(seg):
+                lr = np.diff(np.log(np.abs(seg) + 1e-9))
+                return float(np.std(lr)) if len(lr) > 1 else 0.0
+
+            vol_before = _vol(before_seg)
+            vol_after  = _vol(after_seg)
+
+            # If post-jump volatility is much lower than the jump
+            # magnitude, it looks like a unit/base change, not a crash.
+            jump_mag = abs(pct[idx])
+            vol_max  = max(vol_before, vol_after, 1e-9)
+
+            # Ratio > 8: jump is vastly larger than surrounding daily moves
+            # → almost certainly a data artifact, not a real market event.
+            is_artifact = (jump_mag / vol_max) > 8.0
+
+            if is_artifact:
+                # Rescale everything BEFORE the jump to match the level
+                # just after it, preserving the return path up to that point.
+                factor = vals[idx + 1] / vals[idx]
+                vals[:idx + 1] *= factor
+                direction = "drop" if pct[idx] < 0 else "surge"
+                print(f"    [STITCH] {label}: {direction} of "
+                      f"{pct[idx]*100:.1f}% on "
+                      f"{s.index[idx+1].date()} — rescaled "
+                      f"prior segment ×{factor:.5g}")
+                fixed_any = True
+                break   # restart scan with updated vals
+
+        if not fixed_any:
+            break
+
+    return pd.Series(vals, index=s.index)
+
+
+# ══════════════════════════════════════════════
 #  1. DOWNLOAD
 # ══════════════════════════════════════════════
 print("Downloading price data …")
@@ -117,10 +239,10 @@ for label, (ticker, ccy) in TICKERS.items():
         s  = s.reindex(fx.index).dropna() * fx
     if label in ("Gold (JPY/g)", "Silver (JPY/g)"):
         s = s / TROY_TO_G
-    # Spike removal: drop points > 50% away from 30-day rolling median
-    med   = s.rolling(30, min_periods=1, center=True).median()
-    ratio = s / med
-    s     = s[ratio.between(0.5, 2.0)]
+    # ── Step 1: remove isolated single-bar spikes ──
+    s = _remove_spikes(s)
+    # ── Step 2: stitch permanent level-shifts (Yahoo unit changes) ──
+    s = _stitch_level_shifts(s, label)
     if len(s) < 5:
         print(f"  [SKIP] {label} — insufficient clean data"); continue
     daily[label] = s
