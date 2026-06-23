@@ -326,11 +326,11 @@ plt.rcParams.update({
     "axes.edgecolor":    SPINE_CLR,
 })
 
-fig = plt.figure(figsize=(20, 11))
+fig = plt.figure(figsize=(18, 9))
 
 # axes
-ax_chart  = fig.add_axes([0.25, 0.21, 0.73, 0.69])
-ax_checks = fig.add_axes([0.005, 0.19, 0.235, 0.75])
+ax_chart  = fig.add_axes([0.24, 0.21, 0.73, 0.69])
+ax_checks = fig.add_axes([0.005, 0.19, 0.20, 0.75])
 ax_title  = fig.add_axes([0.25,  0.91, 0.73,  0.07]); ax_title.axis("off")
 
 for ax in (ax_chart, ax_checks, ax_title):
