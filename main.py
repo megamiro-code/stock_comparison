@@ -21,7 +21,7 @@ import yfinance as yf
 #  SETTINGS
 # ══════════════════════════════════════════════
 BASE_VALUE    = 100
-FETCH_START   = "2000-01-01"
+FETCH_START   = "1990-01-01"
 FETCH_END     = date.today().strftime("%Y-%m-%d")
 RESAMPLE_FREQ = "Weekly"
 
@@ -314,7 +314,7 @@ def parse_date(text):
 # ══════════════════════════════════════════════
 _init_ccy  = "JPY"
 _init_freq = RESAMPLE_FREQ
-_ge        = global_earliest(_init_ccy, _init_freq)
+_ge = pd.Timestamp("2024-01-01")
 
 state = {
     "ccy":        _init_ccy,
@@ -349,7 +349,7 @@ y2 = 0.073   # control row 2: freq / ccy / util buttons
 
 fig = plt.figure(figsize=(18, FIG_H))
 
-ax_chart  = fig.add_axes([0.24, 0.20, 0.73, 0.70])
+ax_chart  = fig.add_axes([0.24, 0.22, 0.73, 0.70])
 ax_checks = fig.add_axes([0.005, 0.18, 0.20, 0.76])
 ax_title  = fig.add_axes([0.25,  0.91, 0.73, 0.07])
 ax_title.axis("off")
