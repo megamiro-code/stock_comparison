@@ -48,10 +48,25 @@ ERR_CLR   = "#ff6666"
 BASE_LINE = "#556688"
 
 COLORS = [
-    "#4db8ff","#ff6b6b","#6bff6b","#ffaa4d","#cc88ff",
-    "#ff88cc","#4dffee","#ffee4d","#ff884d","#88ffcc",
-    "#88aaff","#ffcc88","#cc4dff","#88ff44","#ff4488",
-    "#44ccff","#ffbb44",
+    "#4db8ff",   #  1 sky blue        — Nikkei 225
+    "#ff4444",   #  2 vivid red       — TOPIX
+    "#44ff88",   #  3 mint green      — S&P 500
+    "#ffaa00",   #  4 amber           — DAX
+    "#cc77ff",   #  5 violet          — FTSE 100
+    "#ff77aa",   #  6 rose pink       — CAC 40
+    "#00e5cc",   #  7 cyan-teal       — Shanghai
+    "#ffe066",   #  8 bright yellow   — SENSEX
+    "#ff7733",   #  9 orange          — KOSPI
+    "#66ffcc",   # 10 aquamarine      — IBOVESPA
+    "#aabbff",   # 11 periwinkle      — ASX 200
+    "#ffcc44",   # 12 golden yellow   — TSX
+    "#ee44ff",   # 13 magenta         — FTSE MIB
+    "#99ff44",   # 14 lime green      — Gold
+    "#ff99cc",   # 15 soft pink       — Silver
+    "#44ddff",   # 16 light cyan      — J-REIT
+    "#ffbb77",   # 17 peach           — US REIT
+    "#bb99ff",   # 18 lavender        — eMAXIS Slim
+    "#ffffff",   # 19 white           — spare
 ]
 
 TICKERS = {
@@ -72,6 +87,7 @@ TICKERS = {
     "Silver (per g)":         ("SI=F",       "USD"),
     "J-REIT":                 ("1343.T",     "JPY"),
     "US REIT (VNQ)":          ("VNQ",        "USD"),
+    "eMAXIS Slim All-World":  ("0331418A.T", "JPY"),
 }
 
 # All FX quoted as XXX/JPY  (1 foreign unit = N yen)
@@ -151,7 +167,17 @@ def _stitch_level_shifts(s: pd.Series, label: str) -> pd.Series:
 # ══════════════════════════════════════════════
 print("Downloading price data …")
 
+# Fallback tickers tried when the primary ticker returns no data
+TICKER_FALLBACKS = {
+    "0331418A.T": ["2559.T", "7T29.T"],   # オルカン: MAXIS全世界 or SBI全世界
+}
+
 all_t  = list({t for t, _ in TICKERS.values()})
+# also pre-fetch any fallback tickers
+for fallbacks in TICKER_FALLBACKS.values():
+    all_t.extend(fallbacks)
+all_t  = list(set(all_t))
+
 fx_t   = list({FX_MAP[c] for _, c in TICKERS.values() if c != "JPY"})
 
 raw_p  = yf.download(all_t, start=FETCH_START, end=FETCH_END,
@@ -161,6 +187,16 @@ raw_fx = yf.download(fx_t,  start=FETCH_START, end=FETCH_END,
 
 if isinstance(raw_p,  pd.Series): raw_p  = raw_p.to_frame(name=all_t[0])
 if isinstance(raw_fx, pd.Series): raw_fx = raw_fx.to_frame(name=fx_t[0])
+
+def _resolve_ticker(primary: str) -> str:
+    """Return the first ticker (primary or fallback) that has data."""
+    candidates = [primary] + TICKER_FALLBACKS.get(primary, [])
+    for t in candidates:
+        if t in raw_p.columns and not raw_p[t].dropna().empty:
+            if t != primary:
+                print(f"    [FALLBACK] {primary} → using {t}")
+            return t
+    return primary   # will be reported as missing downstream
 
 # ── build per-currency daily series ──
 # daily_local : price in original currency (no FX conversion)
@@ -180,6 +216,7 @@ def _get_usdjpy():
 usdjpy_series = _get_usdjpy()   # 1 USD = N JPY
 
 for label, (ticker, ccy) in TICKERS.items():
+    ticker = _resolve_ticker(ticker)   # use fallback if primary missing
     if ticker not in raw_p.columns:
         print(f"  [SKIP] {label} — ticker not found"); continue
     s_raw = raw_p[ticker].dropna()
@@ -301,11 +338,21 @@ plt.rcParams.update({
     "axes.edgecolor":   SPINE_CLR,
 })
 
-fig = plt.figure(figsize=(18, 9))
+# Scale figure height so each checkbox row gets ~0.40 inch regardless of count
+# Figure height scales with ticker count so every checkbox row fits
+N_LABELS = len(labels_list)
+FIG_H    = max(9.0, N_LABELS * 0.40 + 3.0)   # 0.40 inch per row, min 9 in
 
-ax_chart  = fig.add_axes([0.24, 0.21, 0.73, 0.69])
-ax_checks = fig.add_axes([0.005, 0.19, 0.20, 0.75])
-ax_title  = fig.add_axes([0.25,  0.91, 0.73, 0.07]); ax_title.axis("off")
+# All axes positions are fixed fractions — simple and reliable
+y1 = 0.128   # control row 1: dates / base value
+y2 = 0.073   # control row 2: freq / ccy / util buttons
+
+fig = plt.figure(figsize=(18, FIG_H))
+
+ax_chart  = fig.add_axes([0.24, 0.20, 0.73, 0.70])
+ax_checks = fig.add_axes([0.005, 0.18, 0.20, 0.76])
+ax_title  = fig.add_axes([0.25,  0.91, 0.73, 0.07])
+ax_title.axis("off")
 
 for ax in (ax_chart, ax_checks, ax_title):
     ax.set_facecolor(BG_PANEL)
@@ -336,8 +383,7 @@ def mk_btn(rect, label, color):
     b.label.set_fontsize(9); b.label.set_color(TXT_MAIN)
     return b
 
-# ── control row 1: dates + base value  (y≈0.128) ──
-y1 = 0.128
+# ── control row 1: dates + base value ──
 mk_lbl([0.25, y1, 0.095, 0.038], "Base date (YYYY-MM):")
 tb_date  = mk_tb([0.348, y1+0.004, 0.095, 0.030], _ge.strftime("%Y-%m"))
 
@@ -352,8 +398,7 @@ ax_info = fig.add_axes([0.782, y1, 0.21, 0.038]); ax_info.axis("off")
 ax_info.set_facecolor(BG_CTRL)
 info_txt = ax_info.text(0, 0.5, "", va="center", fontsize=7.5, color=TXT_DIM)
 
-# ── control row 2: freq + currency + util buttons  (y≈0.073) ──
-y2 = 0.073
+# ── control row 2: freq + currency + util buttons ──
 
 # Frequency buttons
 freq_btns = []
