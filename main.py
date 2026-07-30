@@ -65,8 +65,8 @@ COLORS = [
     "#ff99cc",   # 15 soft pink       — Silver
     "#44ddff",   # 16 light cyan      — J-REIT
     "#ffbb77",   # 17 peach           — US REIT
-    "#bb99ff",   # 18 lavender        — eMAXIS Slim
-    "#ffffff",   # 19 white           — spare
+    "#ffffff",   # 18 lavender        — eMAXIS Slim
+    "#444444",   # 19 white           — spare
 ]
 
 TICKERS = {
